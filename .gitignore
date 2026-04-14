@@ -1,0 +1,25 @@
+# Build output
+bin/
+obj/
+buildobj/
+artifacts/
+
+# Local SDK / package caches
+.dotnet/
+.nuget/
+
+# Visual Studio / user-local files
+.vs/
+*.user
+*.suo
+*.userosscache
+*.rsuser
+
+# Logs and temp files
+*.log
+*.tmp
+*.cache
+
+# OS files
+.DS_Store
+Thumbs.db
