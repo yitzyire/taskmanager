@@ -80,6 +80,25 @@ From the repository root:
 dotnet build TaskManager\TaskManager.csproj -c Release
 ```
 
+## Publish Single File
+
+To create the standalone Windows x64 binary locally:
+
+```powershell
+.\publish-single-file.ps1
+```
+
+That uses `TaskManager/Properties/PublishProfiles/SingleFile-win-x64.pubxml` and writes the output to:
+
+```text
+TaskManager\bin\Publish\win-x64-single\TaskManager.exe
+```
+
+GitHub Releases publishing is handled by `.github/workflows/release-single-file.yml`.
+
+- push a tag like `v1.0.0` to build and publish the zipped single-file executable automatically
+- or run the `Release Single File Binary` workflow manually and provide the tag to create/update
+
 ## Run
 
 You can launch the built executable from the standard build output:
