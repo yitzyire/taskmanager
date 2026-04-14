@@ -25,7 +25,7 @@ static class Program
 
             MessageBox.Show(
                 $"{title}\n\n{exception.Message}\n\nA crash log was written to:\n{logPath}",
-                "New Windows Task Manager",
+                "TaskManager",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Error);
         }

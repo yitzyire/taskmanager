@@ -540,7 +540,7 @@ partial class Form1
         MinimumSize = new Size(980, 620);
         StartPosition = FormStartPosition.CenterScreen;
         WindowState = FormWindowState.Maximized;
-        Text = "New Windows Task Manager";
+        Text = "TaskManager";
         mainTabControl.ResumeLayout(false);
         processesTabPage.ResumeLayout(false);
         startupTabPage.ResumeLayout(false);

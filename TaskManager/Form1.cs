@@ -29,7 +29,7 @@ public partial class Form1 : Form
     public Form1()
     {
         InitializeComponent();
-        Text = "New Windows Task Manager";
+        Text = "TaskManager";
         ApplyWindowIcon();
         ApplyWindowChrome();
         Load += (_, _) => ConfigureProcessSplit();

@@ -1,6 +1,6 @@
-# New Windows Task Manager
+# TaskManager
 
-`New Windows Task Manager` is a WinForms-based process inspection tool built as a darker, more technical alternative to the default Windows Task Manager.
+`TaskManager` is a WinForms-based process inspection tool built as a darker, more technical alternative to the default Windows Task Manager.
 
 It focuses on:
 
@@ -157,4 +157,4 @@ When a process is inspected, the tool attempts to collect:
 
 Application name:
 
-`New Windows Task Manager`
+`TaskManager`
