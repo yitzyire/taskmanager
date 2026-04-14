@@ -59,17 +59,17 @@ Some metadata collection is abstracted behind provider classes, but process meta
 
 ## Project Layout
 
-- `NewWindowsTaskManager/Form1.cs`
+- `TaskManager/Form1.cs`
   Main UI logic, refresh flow, process rendering, detail loading, and actions
-- `NewWindowsTaskManager/Form1.Designer.cs`
+- `TaskManager/Form1.Designer.cs`
   WinForms layout and control initialization
-- `NewWindowsTaskManager/NativeProcessMethods.cs`
+- `TaskManager/NativeProcessMethods.cs`
   Native Windows interop helpers for process and service metadata
-- `NewWindowsTaskManager/ProcessMetadataProvider.cs`
+- `TaskManager/ProcessMetadataProvider.cs`
   Metadata provider abstraction
-- `NewWindowsTaskManager/Program.cs`
+- `TaskManager/Program.cs`
   Application entry point
-- `NewWindowsTaskManager/NewWindowsTaskManager.csproj`
+- `TaskManager/TaskManager.csproj`
   Project file
 
 ## Build
@@ -77,13 +77,13 @@ Some metadata collection is abstracted behind provider classes, but process meta
 From the repository root:
 
 ```powershell
-dotnet build NewWindowsTaskManager\NewWindowsTaskManager.csproj -c Release
+dotnet build TaskManager\TaskManager.csproj -c Release
 ```
 
 If you want to publish the output to the shared deploy folder used in this repo:
 
 ```powershell
-dotnet build NewWindowsTaskManager\NewWindowsTaskManager.csproj -c Release -p:OutDir=artifacts\deploy\
+dotnet build TaskManager\TaskManager.csproj -c Release -p:OutDir=artifacts\deploy\
 ```
 
 ## Run
@@ -91,13 +91,13 @@ dotnet build NewWindowsTaskManager\NewWindowsTaskManager.csproj -c Release -p:Ou
 You can launch the built executable from:
 
 ```text
-artifacts\deploy\NewWindowsTaskManager.exe
+artifacts\deploy\TaskManager.exe
 ```
 
 Or from the standard build output:
 
 ```text
-NewWindowsTaskManager\bin\Release\net10.0-windows\NewWindowsTaskManager.exe
+TaskManager\bin\Release\net10.0-windows\TaskManager.exe
 ```
 
 ## How It Works
