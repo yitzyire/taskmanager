@@ -13,6 +13,8 @@ public partial class Form1 : Form
     private readonly Dictionary<string, BinarySecurityDetails> binaryDetailsCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<int, string> processCommandLineCache = [];
     private readonly List<ProcessRowEntry> processRows = [];
+    private readonly HashSet<int> collapsedProcessIds = [];
+    private readonly ProcessRuntimeMetricsProvider processRuntimeMetricsProvider = new();
     private readonly SemaphoreSlim commandLineLoadLimiter = new(2, 2);
     private readonly Dictionary<int, Task<string>> commandLineLoadTasks = [];
     private readonly object commandLineLoadSync = new();
@@ -37,6 +39,7 @@ public partial class Form1 : Form
         mainTabControl.SelectedIndexChanged += mainTabControl_SelectedIndexChanged;
         processGrid.SelectionChanged += processGrid_SelectionChanged;
         processGrid.CellMouseDown += processGrid_CellMouseDown;
+        processGrid.CellMouseClick += processGrid_CellMouseClick;
         processGrid.CellFormatting += processGrid_CellFormatting;
         processGrid.CellValueNeeded += processGrid_CellValueNeeded;
         processGrid.Scroll += processGrid_Scroll;
@@ -47,6 +50,9 @@ public partial class Form1 : Form
         {
             commandLineColumn.DefaultCellStyle.Font = new Font("Consolas", 8.75F);
             commandLineColumn.DefaultCellStyle.ForeColor = Color.FromArgb(148, 163, 184);
+            commandLineColumn.AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill;
+            commandLineColumn.MinimumWidth = 360;
+            commandLineColumn.FillWeight = 100F;
         }
 
         if (processNameColumn is not null)
@@ -71,6 +77,7 @@ public partial class Form1 : Form
             components?.Dispose();
             refreshTimer.Dispose();
             commandLineLoadLimiter.Dispose();
+            processRuntimeMetricsProvider.Dispose();
         }
 
         base.Dispose(disposing);
@@ -220,7 +227,7 @@ public partial class Form1 : Form
         try
         {
             var nowUtc = DateTime.UtcNow;
-            var currentSnapshot = await Task.Run(ProcessSnapshotReader.ReadProcesses);
+            var currentSnapshot = await Task.Run(() => ProcessSnapshotReader.ReadProcesses(processRuntimeMetricsProvider));
             var livePids = currentSnapshot.Keys.ToHashSet();
 
             foreach (var snapshot in currentSnapshot.Values)
@@ -257,6 +264,7 @@ public partial class Form1 : Form
             foreach (var pid in stalePids)
             {
                 processStates.Remove(pid);
+                collapsedProcessIds.Remove(pid);
             }
 
             RenderProcessTree();
@@ -317,7 +325,7 @@ public partial class Form1 : Form
 
             foreach (var rootState in rootStates)
             {
-                AddProcessRows(rootState, childrenByParent, [], 0, processRows);
+                AddProcessRows(rootState, childrenByParent, [], 0, processRows, collapsedProcessIds);
             }
 
             processGrid.RowCount = processRows.Count;
@@ -347,16 +355,20 @@ public partial class Form1 : Form
         IReadOnlyDictionary<int, List<ProcessNodeState>> childrenByParent,
         HashSet<int> ancestry,
         int depth,
-        ICollection<ProcessRowEntry> rows)
+        ICollection<ProcessRowEntry> rows,
+        ISet<int> collapsedProcessIds)
     {
         if (!ancestry.Add(state.ProcessId))
         {
             return;
         }
 
-        rows.Add(new ProcessRowEntry(state, depth));
+        childrenByParent.TryGetValue(state.ProcessId, out var children);
+        var hasChildren = children is { Count: > 0 };
+        var isExpanded = hasChildren && !collapsedProcessIds.Contains(state.ProcessId);
+        rows.Add(new ProcessRowEntry(state, depth, hasChildren, isExpanded));
 
-        if (childrenByParent.TryGetValue(state.ProcessId, out var children))
+        if (hasChildren && isExpanded && children is not null)
         {
             foreach (var child in children)
             {
@@ -365,7 +377,7 @@ public partial class Form1 : Form
                     continue;
                 }
 
-                AddProcessRows(child, childrenByParent, [.. ancestry], depth + 1, rows);
+                AddProcessRows(child, childrenByParent, [.. ancestry], depth + 1, rows, collapsedProcessIds);
             }
         }
     }
@@ -562,6 +574,48 @@ public partial class Form1 : Form
         }
     }
 
+    private void processGrid_CellMouseClick(object? sender, DataGridViewCellMouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Left || e.RowIndex < 0 || e.ColumnIndex < 0)
+        {
+            return;
+        }
+
+        var nameColumn = processGrid.Columns["NameColumn"];
+        if (nameColumn is null || e.ColumnIndex != nameColumn.Index)
+        {
+            return;
+        }
+
+        if (!TryGetProcessRow(e.RowIndex, out var rowEntry) || !rowEntry.HasChildren)
+        {
+            return;
+        }
+
+        if (!IsExpansionGlyphHit(rowEntry, e.X))
+        {
+            return;
+        }
+
+        ToggleProcessExpansion(rowEntry.State.ProcessId);
+    }
+
+    private static bool IsExpansionGlyphHit(ProcessRowEntry rowEntry, int clickX)
+    {
+        var glyphStart = rowEntry.Depth * 22;
+        return clickX >= glyphStart && clickX <= glyphStart + 32;
+    }
+
+    private void ToggleProcessExpansion(int processId)
+    {
+        if (!collapsedProcessIds.Add(processId))
+        {
+            collapsedProcessIds.Remove(processId);
+        }
+
+        RenderProcessTree();
+    }
+
     private void processGrid_CellFormatting(object? sender, DataGridViewCellFormattingEventArgs e)
     {
         if (e.RowIndex < 0 || !TryGetProcessState(e.RowIndex, out var state))
@@ -600,18 +654,53 @@ public partial class Form1 : Form
         var columnName = processGrid.Columns[e.ColumnIndex].Name;
         e.Value = columnName switch
         {
-            "NameColumn" => FormatProcessNamePlain(state, rowEntry.Depth),
+            "NameColumn" => FormatProcessNamePlain(rowEntry),
             "ProcessNameColumn" => state.ProcessName,
             "PidColumn" => state.ProcessId.ToString(),
             "CpuColumn" => $"{state.CpuPercent:N1}%",
             "MemoryColumn" => FormatMemoryColumn(state.WorkingSetBytes),
-            "GpuColumn" => "-",
-            "DiskColumn" => "-",
-            "NetworkColumn" => "-",
+            "GpuColumn" => FormatPercentColumn(state.GpuPercent),
+            "DiskColumn" => FormatThroughputColumn(state.DiskBytesPerSecond),
+            "NetworkColumn" => FormatNetworkColumn(state.NetworkBytesPerSecond, state.NetworkConnectionCount),
             "StatusColumn" => state.IsExited ? "Closed" : "Running",
             "CommandLineColumn" => string.IsNullOrWhiteSpace(state.CommandLine) ? "-" : state.CommandLine,
             _ => string.Empty
         };
+    }
+
+    private static string FormatPercentColumn(double value)
+    {
+        return value > 0
+            ? $"{value:N1}%"
+            : "0.0%";
+    }
+
+    private static string FormatThroughputColumn(double bytesPerSecond)
+    {
+        if (bytesPerSecond <= 0)
+        {
+            return "0 KB/s";
+        }
+
+        var kibPerSecond = bytesPerSecond / 1024d;
+        if (kibPerSecond >= 1024d)
+        {
+            return $"{kibPerSecond / 1024d:N1} MB/s";
+        }
+
+        return $"{kibPerSecond:N0} KB/s";
+    }
+
+    private static string FormatNetworkColumn(double bytesPerSecond, int connectionCount)
+    {
+        if (bytesPerSecond > 0)
+        {
+            return FormatThroughputColumn(bytesPerSecond);
+        }
+
+        return connectionCount > 0
+            ? $"{connectionCount} conn"
+            : "0 conn";
     }
 
     private void UpdateProcessContextMenuState()
@@ -1055,12 +1144,15 @@ public partial class Form1 : Form
             ?.SetValue(grid, true);
     }
 
-    private static string FormatProcessNamePlain(ProcessNodeState state, int depth)
+    private static string FormatProcessNamePlain(ProcessRowEntry rowEntry)
     {
-        var prefix = depth == 0
+        var indent = rowEntry.Depth == 0
             ? string.Empty
-            : $"{new string(' ', depth * 3)}|_ ";
-        return prefix + state.Name;
+            : new string(' ', rowEntry.Depth * 3);
+        var branch = rowEntry.HasChildren
+            ? (rowEntry.IsExpanded ? "[-] " : "[+] ")
+            : "    ";
+        return indent + branch + rowEntry.State.Name;
     }
 
     private const int WM_SETREDRAW = 0x000B;
@@ -1098,7 +1190,7 @@ internal sealed class DarkColorTable : ProfessionalColorTable
     public override Color SeparatorLight => Color.FromArgb(51, 65, 85);
 }
 
-internal readonly record struct ProcessRowEntry(ProcessNodeState State, int Depth);
+internal readonly record struct ProcessRowEntry(ProcessNodeState State, int Depth, bool HasChildren, bool IsExpanded);
 
 internal sealed class ProcessNodeState
 {
@@ -1131,6 +1223,14 @@ internal sealed class ProcessNodeState
 
     public long WorkingSetBytes { get; private set; }
 
+    public double GpuPercent { get; private set; }
+
+    public double DiskBytesPerSecond { get; private set; }
+
+    public double NetworkBytesPerSecond { get; private set; }
+
+    public int NetworkConnectionCount { get; private set; }
+
     public DateTime FirstSeenUtc { get; }
 
     public bool WasSeenAfterLaunch { get; }
@@ -1156,6 +1256,10 @@ internal sealed class ProcessNodeState
             CommandLine = snapshot.CommandLine;
         }
         WorkingSetBytes = snapshot.WorkingSetBytes;
+        GpuPercent = snapshot.GpuPercent;
+        DiskBytesPerSecond = snapshot.DiskBytesPerSecond;
+        NetworkBytesPerSecond = snapshot.NetworkBytesPerSecond;
+        NetworkConnectionCount = snapshot.NetworkConnectionCount;
         CpuPercent = ComputeCpuPercent(snapshot.TotalProcessorTime, seenUtc);
         IsExited = false;
         ExitedAtUtc = null;
@@ -1167,6 +1271,10 @@ internal sealed class ProcessNodeState
         ExitedAtUtc = exitedAtUtc;
         WorkingSetBytes = 0;
         CpuPercent = 0;
+        GpuPercent = 0;
+        DiskBytesPerSecond = 0;
+        NetworkBytesPerSecond = 0;
+        NetworkConnectionCount = 0;
     }
 
     private double ComputeCpuPercent(TimeSpan totalProcessorTime, DateTime seenUtc)
@@ -1308,13 +1416,18 @@ internal sealed record ProcessSnapshot(
     string? ExecutablePath,
     string CommandLine,
     long WorkingSetBytes,
+    double GpuPercent,
+    double DiskBytesPerSecond,
+    double NetworkBytesPerSecond,
+    int NetworkConnectionCount,
     TimeSpan TotalProcessorTime);
 
 internal static class ProcessSnapshotReader
 {
-    public static Dictionary<int, ProcessSnapshot> ReadProcesses()
+    public static Dictionary<int, ProcessSnapshot> ReadProcesses(ProcessRuntimeMetricsProvider metricsProvider)
     {
         var parents = NativeProcessMethods.ReadParentProcessMap();
+        var runtimeMetrics = metricsProvider.ReadCurrentMetrics();
         var snapshots = new Dictionary<int, ProcessSnapshot>();
 
         foreach (var process in Process.GetProcesses())
@@ -1325,6 +1438,7 @@ internal static class ProcessSnapshotReader
                 var processName = SafeRead(() => process.ProcessName, $"pid-{process.Id}");
                 var workingSet = SafeRead(() => process.WorkingSet64, 0L);
                 var totalProcessorTime = SafeRead(() => process.TotalProcessorTime, TimeSpan.Zero);
+                var metrics = runtimeMetrics.GetValueOrDefault(process.Id);
                 int? parentPid = parents.TryGetValue(process.Id, out var value) && value > 0 ? value : null;
                 snapshots[process.Id] = new ProcessSnapshot(
                     process.Id,
@@ -1334,6 +1448,10 @@ internal static class ProcessSnapshotReader
                     null,
                     string.Empty,
                     workingSet,
+                    metrics.GpuPercent,
+                    metrics.DiskBytesPerSecond,
+                    metrics.NetworkBytesPerSecond,
+                    metrics.ConnectionCount,
                     totalProcessorTime);
             }
         }
@@ -1350,6 +1468,169 @@ internal static class ProcessSnapshotReader
         catch
         {
             return fallback;
+        }
+    }
+}
+
+internal readonly record struct ProcessRuntimeMetrics(double DiskBytesPerSecond, double NetworkBytesPerSecond, int ConnectionCount, double GpuPercent);
+
+internal sealed class ProcessRuntimeMetricsProvider : IDisposable
+{
+    private readonly object sync = new();
+    private readonly Dictionary<int, (ulong Bytes, DateTime SampleUtc)> lastDiskSamples = [];
+    private readonly Dictionary<string, CounterSample> lastGpuSamples = new(StringComparer.OrdinalIgnoreCase);
+    private readonly bool gpuCountersAvailable;
+
+    public ProcessRuntimeMetricsProvider()
+    {
+        try
+        {
+            gpuCountersAvailable = PerformanceCounterCategory.Exists("GPU Engine");
+        }
+        catch
+        {
+            gpuCountersAvailable = false;
+        }
+    }
+
+    public IReadOnlyDictionary<int, ProcessRuntimeMetrics> ReadCurrentMetrics()
+    {
+        lock (sync)
+        {
+            var connectionCounts = NativeProcessMethods.ReadNetworkConnectionCounts();
+            var gpuPercents = gpuCountersAvailable ? ReadGpuUsage() : new Dictionary<int, double>();
+            var metrics = new Dictionary<int, ProcessRuntimeMetrics>();
+            var sampledAtUtc = DateTime.UtcNow;
+
+            foreach (var process in Process.GetProcesses())
+            {
+                using (process)
+                {
+                    var pid = process.Id;
+                    var diskRate = NativeProcessMethods.TryGetProcessDiskBytes(pid, out var totalDiskBytes)
+                        ? ComputeDiskBytesPerSecond(pid, totalDiskBytes, sampledAtUtc)
+                        : 0d;
+
+                    connectionCounts.TryGetValue(pid, out var connectionCount);
+                    gpuPercents.TryGetValue(pid, out var gpuPercent);
+
+                    metrics[pid] = new ProcessRuntimeMetrics(
+                        diskRate,
+                        0d,
+                        connectionCount,
+                        gpuPercent);
+                }
+            }
+
+            CleanupState(metrics.Keys);
+            return metrics;
+        }
+    }
+
+    public void Dispose()
+    {
+    }
+
+    private double ComputeDiskBytesPerSecond(int pid, ulong totalDiskBytes, DateTime sampledAtUtc)
+    {
+        if (!lastDiskSamples.TryGetValue(pid, out var previous))
+        {
+            lastDiskSamples[pid] = (totalDiskBytes, sampledAtUtc);
+            return 0d;
+        }
+
+        lastDiskSamples[pid] = (totalDiskBytes, sampledAtUtc);
+        var elapsedSeconds = (sampledAtUtc - previous.SampleUtc).TotalSeconds;
+        if (elapsedSeconds <= 0 || totalDiskBytes < previous.Bytes)
+        {
+            return 0d;
+        }
+
+        return (totalDiskBytes - previous.Bytes) / elapsedSeconds;
+    }
+
+    private Dictionary<int, double> ReadGpuUsage()
+    {
+        var usageByPid = new Dictionary<int, double>();
+        string[] instanceNames;
+
+        try
+        {
+            instanceNames = new PerformanceCounterCategory("GPU Engine").GetInstanceNames();
+        }
+        catch
+        {
+            return usageByPid;
+        }
+
+        var activeInstances = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var instanceName in instanceNames)
+        {
+            var pid = TryParseGpuPid(instanceName);
+            if (!pid.HasValue)
+            {
+                continue;
+            }
+
+            activeInstances.Add(instanceName);
+
+            try
+            {
+                using var counter = new PerformanceCounter("GPU Engine", "Utilization Percentage", instanceName, readOnly: true);
+                var currentSample = counter.NextSample();
+                double utilization = 0;
+
+                if (lastGpuSamples.TryGetValue(instanceName, out var previousSample))
+                {
+                    utilization = CounterSample.Calculate(previousSample, currentSample);
+                }
+
+                lastGpuSamples[instanceName] = currentSample;
+                if (!double.IsNaN(utilization) && !double.IsInfinity(utilization) && utilization > 0)
+                {
+                    usageByPid[pid.Value] = usageByPid.GetValueOrDefault(pid.Value) + utilization;
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        foreach (var staleInstance in lastGpuSamples.Keys.Except(activeInstances, StringComparer.OrdinalIgnoreCase).ToArray())
+        {
+            lastGpuSamples.Remove(staleInstance);
+        }
+
+        return usageByPid;
+    }
+
+    private static int? TryParseGpuPid(string instanceName)
+    {
+        const string marker = "pid_";
+        var start = instanceName.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+        if (start < 0)
+        {
+            return null;
+        }
+
+        start += marker.Length;
+        var end = start;
+        while (end < instanceName.Length && char.IsDigit(instanceName[end]))
+        {
+            end++;
+        }
+
+        return end > start && int.TryParse(instanceName[start..end], out var pid)
+            ? pid
+            : null;
+    }
+
+    private void CleanupState(IEnumerable<int> livePids)
+    {
+        var livePidSet = livePids.ToHashSet();
+        foreach (var stalePid in lastDiskSamples.Keys.Where(pid => !livePidSet.Contains(pid)).ToArray())
+        {
+            lastDiskSamples.Remove(stalePid);
         }
     }
 }

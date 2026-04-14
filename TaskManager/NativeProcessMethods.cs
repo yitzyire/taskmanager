@@ -7,7 +7,11 @@ namespace TaskManager;
 
 internal static class NativeProcessMethods
 {
+    private const int AddressFamilyInterNetwork = 2;
+    private const int AddressFamilyInterNetworkV6 = 23;
     private const uint SnapshotProcess = 0x00000002;
+    private const int TcpTableOwnerPidAll = 5;
+    private const int UdpTableOwnerPid = 1;
     private const uint QueryLimitedInformation = 0x1000;
     private const uint VirtualMemoryRead = 0x0010;
 
@@ -145,6 +149,41 @@ internal static class NativeProcessMethods
         };
     }
 
+    public static bool TryGetProcessDiskBytes(int processId, out ulong totalBytes)
+    {
+        totalBytes = 0;
+        var handle = OpenProcess(QueryLimitedInformation, false, processId);
+        if (handle == IntPtr.Zero)
+        {
+            return false;
+        }
+
+        try
+        {
+            if (!GetProcessIoCounters(handle, out var counters))
+            {
+                return false;
+            }
+
+            totalBytes = counters.ReadTransferCount + counters.WriteTransferCount;
+            return true;
+        }
+        finally
+        {
+            CloseHandle(handle);
+        }
+    }
+
+    public static Dictionary<int, int> ReadNetworkConnectionCounts()
+    {
+        var counts = new Dictionary<int, int>();
+        ReadTcpConnections(AddressFamilyInterNetwork, counts);
+        ReadTcpConnections(AddressFamilyInterNetworkV6, counts);
+        ReadUdpListeners(AddressFamilyInterNetwork, counts);
+        ReadUdpListeners(AddressFamilyInterNetworkV6, counts);
+        return counts;
+    }
+
     private static string? TryReadFromManagedProcess(int processId)
     {
         try
@@ -178,6 +217,27 @@ internal static class NativeProcessMethods
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool CloseHandle(IntPtr hObject);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetProcessIoCounters(IntPtr hProcess, out IO_COUNTERS ioCounters);
+
+    [DllImport("iphlpapi.dll", SetLastError = true)]
+    private static extern uint GetExtendedTcpTable(
+        IntPtr pTcpTable,
+        ref int pdwSize,
+        bool bOrder,
+        int ulAf,
+        int tableClass,
+        uint reserved);
+
+    [DllImport("iphlpapi.dll", SetLastError = true)]
+    private static extern uint GetExtendedUdpTable(
+        IntPtr pUdpTable,
+        ref int pdwSize,
+        bool bOrder,
+        int ulAf,
+        int tableClass,
+        uint reserved);
 
     [DllImport("ntdll.dll")]
     private static extern int NtQueryInformationProcess(
@@ -220,6 +280,108 @@ internal static class NativeProcessMethods
         }
     }
 
+    private static void ReadTcpConnections(int addressFamily, IDictionary<int, int> counts)
+    {
+        var size = 0;
+        _ = GetExtendedTcpTable(IntPtr.Zero, ref size, true, addressFamily, TcpTableOwnerPidAll, 0);
+        if (size <= 0)
+        {
+            return;
+        }
+
+        var buffer = Marshal.AllocHGlobal(size);
+        try
+        {
+            if (GetExtendedTcpTable(buffer, ref size, true, addressFamily, TcpTableOwnerPidAll, 0) != 0)
+            {
+                return;
+            }
+
+            var rowCount = Marshal.ReadInt32(buffer);
+            var rowPtr = buffer + sizeof(int);
+
+            if (addressFamily == AddressFamilyInterNetwork)
+            {
+                var rowSize = Marshal.SizeOf<MIB_TCPROW_OWNER_PID>();
+                for (var index = 0; index < rowCount; index++)
+                {
+                    var row = Marshal.PtrToStructure<MIB_TCPROW_OWNER_PID>(rowPtr + (index * rowSize));
+                    IncrementCount(counts, unchecked((int)row.owningPid));
+                }
+            }
+            else
+            {
+                var rowSize = Marshal.SizeOf<MIB_TCP6ROW_OWNER_PID>();
+                for (var index = 0; index < rowCount; index++)
+                {
+                    var row = Marshal.PtrToStructure<MIB_TCP6ROW_OWNER_PID>(rowPtr + (index * rowSize));
+                    IncrementCount(counts, unchecked((int)row.owningPid));
+                }
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
+
+    private static void ReadUdpListeners(int addressFamily, IDictionary<int, int> counts)
+    {
+        var size = 0;
+        _ = GetExtendedUdpTable(IntPtr.Zero, ref size, true, addressFamily, UdpTableOwnerPid, 0);
+        if (size <= 0)
+        {
+            return;
+        }
+
+        var buffer = Marshal.AllocHGlobal(size);
+        try
+        {
+            if (GetExtendedUdpTable(buffer, ref size, true, addressFamily, UdpTableOwnerPid, 0) != 0)
+            {
+                return;
+            }
+
+            var rowCount = Marshal.ReadInt32(buffer);
+            var rowPtr = buffer + sizeof(int);
+
+            if (addressFamily == AddressFamilyInterNetwork)
+            {
+                var rowSize = Marshal.SizeOf<MIB_UDPROW_OWNER_PID>();
+                for (var index = 0; index < rowCount; index++)
+                {
+                    var row = Marshal.PtrToStructure<MIB_UDPROW_OWNER_PID>(rowPtr + (index * rowSize));
+                    IncrementCount(counts, unchecked((int)row.owningPid));
+                }
+            }
+            else
+            {
+                var rowSize = Marshal.SizeOf<MIB_UDP6ROW_OWNER_PID>();
+                for (var index = 0; index < rowCount; index++)
+                {
+                    var row = Marshal.PtrToStructure<MIB_UDP6ROW_OWNER_PID>(rowPtr + (index * rowSize));
+                    IncrementCount(counts, unchecked((int)row.owningPid));
+                }
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
+
+    private static void IncrementCount(IDictionary<int, int> counts, int pid)
+    {
+        if (pid <= 0)
+        {
+            return;
+        }
+
+        counts[pid] = counts.TryGetValue(pid, out var current)
+            ? current + 1
+            : 1;
+    }
+
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     private struct PROCESSENTRY32
     {
@@ -254,6 +416,61 @@ internal static class NativeProcessMethods
         public ushort Length;
         public ushort MaximumLength;
         public IntPtr Buffer;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IO_COUNTERS
+    {
+        public ulong ReadOperationCount;
+        public ulong WriteOperationCount;
+        public ulong OtherOperationCount;
+        public ulong ReadTransferCount;
+        public ulong WriteTransferCount;
+        public ulong OtherTransferCount;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MIB_TCPROW_OWNER_PID
+    {
+        public uint state;
+        public uint localAddr;
+        public uint localPort;
+        public uint remoteAddr;
+        public uint remotePort;
+        public uint owningPid;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MIB_TCP6ROW_OWNER_PID
+    {
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)]
+        public byte[] localAddr;
+        public uint localScopeId;
+        public uint localPort;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)]
+        public byte[] remoteAddr;
+        public uint remoteScopeId;
+        public uint remotePort;
+        public uint state;
+        public uint owningPid;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MIB_UDPROW_OWNER_PID
+    {
+        public uint localAddr;
+        public uint localPort;
+        public uint owningPid;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MIB_UDP6ROW_OWNER_PID
+    {
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)]
+        public byte[] localAddr;
+        public uint localScopeId;
+        public uint localPort;
+        public uint owningPid;
     }
 }
 

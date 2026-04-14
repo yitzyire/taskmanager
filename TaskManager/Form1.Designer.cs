@@ -251,7 +251,7 @@ partial class Form1
         processGrid.BackgroundColor = Color.FromArgb(18, 24, 32);
         processGrid.DefaultCellStyle.BackColor = Color.FromArgb(18, 24, 32);
         processGrid.DefaultCellStyle.ForeColor = Color.FromArgb(226, 232, 240);
-        processGrid.DefaultCellStyle.SelectionBackColor = Color.FromArgb(30, 64, 100);
+        processGrid.DefaultCellStyle.SelectionBackColor = Color.FromArgb(36, 45, 56);
         processGrid.DefaultCellStyle.SelectionForeColor = Color.FromArgb(241, 245, 249);
         processGrid.ColumnHeadersDefaultCellStyle.BackColor = Color.FromArgb(20, 27, 35);
         processGrid.ColumnHeadersDefaultCellStyle.ForeColor = Color.FromArgb(241, 245, 249);
@@ -266,7 +266,7 @@ partial class Form1
         processGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "DiskColumn", HeaderText = "Disk", Width = 70, SortMode = DataGridViewColumnSortMode.NotSortable });
         processGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "NetworkColumn", HeaderText = "Network", Width = 80, SortMode = DataGridViewColumnSortMode.NotSortable });
         processGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "StatusColumn", HeaderText = "Status", Width = 100, SortMode = DataGridViewColumnSortMode.NotSortable });
-        processGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "CommandLineColumn", HeaderText = "Command line", Width = 360, SortMode = DataGridViewColumnSortMode.NotSortable });
+        processGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "CommandLineColumn", HeaderText = "Command line", Width = 360, MinimumWidth = 360, AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill, FillWeight = 100F, SortMode = DataGridViewColumnSortMode.NotSortable });
         processToolbarPanel.Controls.Add(processSearchTextBox);
         processToolbarPanel.Controls.Add(processSearchLabel);
         processToolbarPanel.Controls.Add(processStatusLabel);

@@ -80,21 +80,9 @@ From the repository root:
 dotnet build TaskManager\TaskManager.csproj -c Release
 ```
 
-If you want to publish the output to the shared deploy folder used in this repo:
-
-```powershell
-dotnet build TaskManager\TaskManager.csproj -c Release -p:OutDir=artifacts\deploy\
-```
-
 ## Run
 
-You can launch the built executable from:
-
-```text
-artifacts\deploy\TaskManager.exe
-```
-
-Or from the standard build output:
+You can launch the built executable from the standard build output:
 
 ```text
 TaskManager\bin\Release\net10.0-windows\TaskManager.exe
@@ -133,21 +121,20 @@ When a process is inspected, the tool attempts to collect:
 
 ## Known Limitations
 
-- `GPU`, `Disk`, and `Network` columns are currently placeholders and do not yet show real per-process metrics
+- `Disk` now shows per-process throughput derived from Windows I/O counters
+- `GPU` uses the Windows `GPU Engine` performance counters, so some systems or drivers may report little or no usable data
+- `Network` currently shows live per-process connection activity when byte-accurate per-process throughput is not available through the lightweight collection path used by this app
 - command line hydration is asynchronous, so it may populate progressively instead of appearing instantly for every row
 - some protected system processes may not expose full metadata
 - because the app uses WinForms, it is not cross-platform as a UI application
-- if the deployed executable is still running, rebuilding directly into `artifacts\deploy\` can fail because Windows locks the `.exe`
 
 ## Development Notes
 
-- avoid rebuilding into `artifacts\deploy\` while the deployed executable is open
-- if the app is running from the deploy folder, close it before overwriting that executable
 - the codebase has been tuned to reduce obvious refresh flicker, but future improvements could include more diff-based row updates and richer live metrics
 
 ## Next Improvements
 
-- real `GPU`, `Disk`, and `Network` usage collection
+- more accurate per-process network throughput via ETW or a similar deeper telemetry path
 - deeper process ancestry and child expansion controls
 - richer service details
 - export / snapshot support
