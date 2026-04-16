@@ -1,5 +1,6 @@
-﻿using System.ComponentModel;
+using System.ComponentModel;
 using System.Diagnostics;
+using System.Net;
 using System.Runtime.InteropServices;
 using Microsoft.Win32;
 
@@ -182,6 +183,14 @@ internal static class NativeProcessMethods
         ReadUdpListeners(AddressFamilyInterNetwork, counts);
         ReadUdpListeners(AddressFamilyInterNetworkV6, counts);
         return counts;
+    }
+
+    public static List<ActiveTcpConnection> ReadActiveTcpConnections()
+    {
+        List<ActiveTcpConnection> connections = [];
+        ReadTcpConnectionsDetailed(AddressFamilyInterNetwork, connections);
+        ReadTcpConnectionsDetailed(AddressFamilyInterNetworkV6, connections);
+        return connections;
     }
 
     private static string? TryReadFromManagedProcess(int processId)
@@ -370,6 +379,72 @@ internal static class NativeProcessMethods
         }
     }
 
+    private static void ReadTcpConnectionsDetailed(int addressFamily, ICollection<ActiveTcpConnection> connections)
+    {
+        var size = 0;
+        _ = GetExtendedTcpTable(IntPtr.Zero, ref size, true, addressFamily, TcpTableOwnerPidAll, 0);
+        if (size <= 0)
+        {
+            return;
+        }
+
+        var buffer = Marshal.AllocHGlobal(size);
+        try
+        {
+            if (GetExtendedTcpTable(buffer, ref size, true, addressFamily, TcpTableOwnerPidAll, 0) != 0)
+            {
+                return;
+            }
+
+            var rowCount = Marshal.ReadInt32(buffer);
+            var rowPtr = buffer + sizeof(int);
+            if (addressFamily == AddressFamilyInterNetwork)
+            {
+                var rowSize = Marshal.SizeOf<MIB_TCPROW_OWNER_PID>();
+                for (var index = 0; index < rowCount; index++)
+                {
+                    var row = Marshal.PtrToStructure<MIB_TCPROW_OWNER_PID>(rowPtr + (index * rowSize));
+                    var remoteIp = new IPAddress(row.remoteAddr).ToString();
+                    if (string.IsNullOrWhiteSpace(remoteIp) || remoteIp == "0.0.0.0")
+                    {
+                        continue;
+                    }
+
+                    connections.Add(new ActiveTcpConnection(
+                        unchecked((int)row.owningPid),
+                        "TCP",
+                        remoteIp,
+                        ConvertPort(row.remotePort),
+                        ConvertTcpState(row.state)));
+                }
+            }
+            else
+            {
+                var rowSize = Marshal.SizeOf<MIB_TCP6ROW_OWNER_PID>();
+                for (var index = 0; index < rowCount; index++)
+                {
+                    var row = Marshal.PtrToStructure<MIB_TCP6ROW_OWNER_PID>(rowPtr + (index * rowSize));
+                    var remoteIp = new IPAddress(row.remoteAddr, row.remoteScopeId).ToString();
+                    if (string.IsNullOrWhiteSpace(remoteIp) || remoteIp == "::")
+                    {
+                        continue;
+                    }
+
+                    connections.Add(new ActiveTcpConnection(
+                        unchecked((int)row.owningPid),
+                        "TCPv6",
+                        remoteIp,
+                        ConvertPort(row.remotePort),
+                        ConvertTcpState(row.state)));
+                }
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
+
     private static void IncrementCount(IDictionary<int, int> counts, int pid)
     {
         if (pid <= 0)
@@ -380,6 +455,31 @@ internal static class NativeProcessMethods
         counts[pid] = counts.TryGetValue(pid, out var current)
             ? current + 1
             : 1;
+    }
+
+    private static int ConvertPort(uint port)
+    {
+        return (ushort)IPAddress.NetworkToHostOrder((short)(port >> 16));
+    }
+
+    private static string ConvertTcpState(uint state)
+    {
+        return state switch
+        {
+            1 => "Closed",
+            2 => "Listen",
+            3 => "Syn Sent",
+            4 => "Syn Received",
+            5 => "Established",
+            6 => "Fin Wait 1",
+            7 => "Fin Wait 2",
+            8 => "Close Wait",
+            9 => "Closing",
+            10 => "Last Ack",
+            11 => "Time Wait",
+            12 => "Delete Tcb",
+            _ => "Unknown"
+        };
     }
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
@@ -474,3 +574,4 @@ internal static class NativeProcessMethods
     }
 }
 
+internal readonly record struct ActiveTcpConnection(int ProcessId, string Protocol, string RemoteAddress, int RemotePort, string State);

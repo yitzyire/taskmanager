@@ -3,6 +3,8 @@ using System.Drawing.Drawing2D;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
+using Microsoft.Diagnostics.Tracing.Parsers;
+using Microsoft.Diagnostics.Tracing.Session;
 using Microsoft.Win32;
 
 namespace TaskManager;
@@ -10,21 +12,32 @@ namespace TaskManager;
 public partial class Form1 : Form
 {
     private readonly Dictionary<int, ProcessNodeState> processStates = [];
+    private readonly List<ProcessHistoryEntry> processHistoryEntries = [];
+    private readonly Dictionary<int, ProcessHistoryEntry> activeProcessHistoryEntries = [];
     private readonly Dictionary<string, BinarySecurityDetails> binaryDetailsCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<int, string> processCommandLineCache = [];
+    private readonly Dictionary<ConnectionRecordKey, ConnectionRecord> connectionRecords = [];
+    private readonly HashSet<string> pendingDnsLookups = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<ProcessRowEntry> processRows = [];
+    private readonly List<ProcessHistoryRowEntry> processHistoryRows = [];
     private readonly HashSet<int> collapsedProcessIds = [];
+    private readonly HashSet<long> collapsedProcessHistoryIds = [];
     private readonly ProcessRuntimeMetricsProvider processRuntimeMetricsProvider = new();
     private readonly SemaphoreSlim commandLineLoadLimiter = new(2, 2);
     private readonly Dictionary<int, Task<string>> commandLineLoadTasks = [];
     private readonly object commandLineLoadSync = new();
-    private readonly System.Windows.Forms.Timer refreshTimer = new() { Interval = 4000 };
+    private readonly System.Windows.Forms.Timer refreshTimer = new() { Interval = 1000 };
     private readonly DateTime appStartedUtc = DateTime.UtcNow;
     private readonly string processNameColumnName = "ProcessNameColumn";
     private readonly string processCommandLineColumnName = "CommandLineColumn";
+    private long nextProcessHistoryId = 1;
+    private string? processSortColumnName;
+    private SortOrder processSortOrder = SortOrder.None;
     private bool isRefreshingProcesses;
     private bool isRefreshingStartup;
+    private bool isRefreshingTasks;
     private bool isRefreshingServices;
+    private bool isRefreshingConnections;
     private bool isRebuildingProcessGrid;
     private int? lastRenderedDetailsPid;
 
@@ -41,8 +54,11 @@ public partial class Form1 : Form
         processGrid.CellMouseDown += processGrid_CellMouseDown;
         processGrid.CellMouseClick += processGrid_CellMouseClick;
         processGrid.CellFormatting += processGrid_CellFormatting;
+        processHistoryGrid.CellFormatting += processHistoryGrid_CellFormatting;
         processGrid.CellValueNeeded += processGrid_CellValueNeeded;
+        processGrid.ColumnHeaderMouseClick += processGrid_ColumnHeaderMouseClick;
         processGrid.Scroll += processGrid_Scroll;
+        processHistoryGrid.CellMouseClick += processHistoryGrid_CellMouseClick;
         processGrid.VirtualMode = true;
         var commandLineColumn = processGrid.Columns[processCommandLineColumnName];
         var processNameColumn = processGrid.Columns[processNameColumnName];
@@ -61,6 +77,7 @@ public partial class Form1 : Form
         }
 
         EnableDoubleBuffering(processGrid);
+        EnableDoubleBuffering(processHistoryGrid);
         refreshTimer.Tick += async (_, _) => await RefreshProcessesAsync();
         refreshTimer.Start();
         Shown += async (_, _) =>
@@ -174,27 +191,32 @@ public partial class Form1 : Form
     private void endTaskButton_Click(object? sender, EventArgs e) => EndSelectedProcess();
 
     private async void refreshStartupButton_Click(object? sender, EventArgs e) => await RefreshStartupItemsAsync();
+    private async void refreshTasksButton_Click(object? sender, EventArgs e) => await RefreshScheduledTasksAsync();
 
     private async void refreshServicesButton_Click(object? sender, EventArgs e) => await RefreshServicesAsync();
 
     private async void openFileLocationToolStripMenuItem_Click(object? sender, EventArgs e) => await OpenSelectedProcessLocationAsync();
 
     private void processSearchTextBox_TextChanged(object? sender, EventArgs e) => RenderProcessTree();
+    private void processHistorySearchTextBox_TextChanged(object? sender, EventArgs e) => RenderProcessHistoryGrid();
 
     private void processesTabButton_Click(object? sender, EventArgs e) => mainTabControl.SelectedTab = processesTabPage;
+    private void processHistoryTabButton_Click(object? sender, EventArgs e) => mainTabControl.SelectedTab = processHistoryTabPage;
 
     private void startupTabButton_Click(object? sender, EventArgs e) => mainTabControl.SelectedTab = startupTabPage;
+    private void tasksTabButton_Click(object? sender, EventArgs e) => mainTabControl.SelectedTab = tasksTabPage;
 
     private void servicesTabButton_Click(object? sender, EventArgs e) => mainTabControl.SelectedTab = servicesTabPage;
 
-    private void callsTabButton_Click(object? sender, EventArgs e) => mainTabControl.SelectedTab = callsTabPage;
+    private void conTabButton_Click(object? sender, EventArgs e) => mainTabControl.SelectedTab = conTabPage;
 
     private void mainTabControl_SelectedIndexChanged(object? sender, EventArgs e) => UpdateTabButtons();
 
     private void clearCallsButton_Click(object? sender, EventArgs e)
     {
+        connectionRecords.Clear();
         callsGrid.Rows.Clear();
-        UpdateCallsStatus();
+        UpdateConnectionStatus();
     }
 
     private void startServiceButton_Click(object? sender, EventArgs e) => ChangeSelectedService(ServiceAction.Start);
@@ -204,14 +226,16 @@ public partial class Form1 : Form
     private async Task BeginInitialLoadAsync()
     {
         processStatusLabel.Text = "Loading processes...";
+        processHistoryStatusLabel.Text = "Watching for process launches and exits...";
         startupStatusLabel.Text = "Loading startup items...";
+        tasksStatusLabel.Text = "Loading scheduled tasks...";
         servicesStatusLabel.Text = "Loading services...";
-        LogCall("Application", "Launch", "Initialized dark-mode task manager shell.");
-
+        callsStatusLabel.Text = "Loading connections...";
         var processTask = RefreshProcessesAsync();
         var startupTask = RefreshStartupItemsAsync();
+        var tasksTask = RefreshScheduledTasksAsync();
         var servicesTask = RefreshServicesAsync();
-        await Task.WhenAll(processTask, startupTask, servicesTask);
+        await Task.WhenAll(processTask, startupTask, tasksTask, servicesTask);
     }
 
     private async Task RefreshProcessesAsync()
@@ -241,6 +265,7 @@ public partial class Form1 : Form
                     }
 
                     processStates[snapshot.ProcessId] = createdState;
+                    TrackProcessHistory(createdState, nowUtc);
                     continue;
                 }
 
@@ -249,11 +274,14 @@ public partial class Form1 : Form
                 {
                     state.CommandLine = cachedCommandLineForState;
                 }
+
+                UpdateActiveProcessHistory(state, nowUtc);
             }
 
             foreach (var state in processStates.Values.Where(state => !state.IsExited && !livePids.Contains(state.ProcessId)))
             {
                 state.MarkExited(nowUtc);
+                MarkProcessHistoryExited(state.ProcessId, nowUtc);
             }
 
             var stalePids = processStates.Values
@@ -267,13 +295,14 @@ public partial class Form1 : Form
                 collapsedProcessIds.Remove(pid);
             }
 
+            await RefreshConnectionsAsync(currentSnapshot);
             RenderProcessTree();
+            RenderProcessHistoryGrid();
             processStatusLabel.Text = $"Processes: {currentSnapshot.Count} live, {processStates.Values.Count(state => state.IsExited)} recently closed";
         }
         catch (Exception ex)
         {
             processStatusLabel.Text = $"Process refresh failed: {ex.Message}";
-            LogCall("Processes", "Refresh Failed", ex.Message);
         }
         finally
         {
@@ -303,16 +332,18 @@ public partial class Form1 : Form
             .Where(state => state.ParentProcessId is null
                 || state.ParentProcessId == state.ProcessId
                 || !visiblePidSet.Contains(state.ParentProcessId.Value))
-            .OrderBy(state => state.IsExited)
-            .ThenBy(state => state.Name, StringComparer.OrdinalIgnoreCase)
             .ToList();
 
         if (rootStates.Count == 0)
         {
             rootStates = visibleStates
-                .OrderBy(state => state.IsExited)
-                .ThenBy(state => state.Name, StringComparer.OrdinalIgnoreCase)
                 .ToList();
+        }
+
+        SortProcessStates(rootStates);
+        foreach (var childList in childrenByParent.Values)
+        {
+            SortProcessStates(childList);
         }
 
         SuspendControlDrawing(processGrid);
@@ -418,19 +449,19 @@ public partial class Form1 : Form
 
     private static Color GetProcessNodeColor(ProcessNodeState state)
     {
-        if (state.IsExited)
-        {
-            return Color.FromArgb(220, 110, 110);
-        }
-
         if (state.WasSeenAfterLaunch)
         {
             return Color.FromArgb(94, 234, 150);
         }
 
+        if (state.IsExited)
+        {
+            return Color.FromArgb(220, 110, 110);
+        }
+
         if (state.ParentProcessId is null || state.ParentProcessId == state.ProcessId)
         {
-            return Color.FromArgb(120, 171, 219);
+            return Color.FromArgb(96, 165, 250);
         }
 
         return Color.FromArgb(208, 216, 224);
@@ -634,12 +665,26 @@ public partial class Form1 : Form
         }
 
         var nameColumn = processGrid.Columns["NameColumn"];
-        if (nameColumn is not null
-            && e.ColumnIndex == nameColumn.Index
-            && (state.ParentProcessId is null || state.ParentProcessId == state.ProcessId))
+        if (nameColumn is not null && e.ColumnIndex == nameColumn.Index)
         {
-            e.CellStyle.ForeColor = Color.FromArgb(120, 171, 219);
+            e.CellStyle.ForeColor = GetProcessNodeColor(state);
         }
+    }
+
+    private void processGrid_ColumnHeaderMouseClick(object? sender, DataGridViewCellMouseEventArgs e)
+    {
+        if (e.ColumnIndex < 0 || e.ColumnIndex >= processGrid.Columns.Count)
+        {
+            return;
+        }
+
+        var clickedColumn = processGrid.Columns[e.ColumnIndex];
+        processSortOrder = processSortColumnName == clickedColumn.Name && processSortOrder == SortOrder.Ascending
+            ? SortOrder.Descending
+            : SortOrder.Ascending;
+        processSortColumnName = clickedColumn.Name;
+        UpdateProcessSortGlyphs();
+        RenderProcessTree();
     }
 
     private void processGrid_CellValueNeeded(object? sender, DataGridViewCellValueEventArgs e)
@@ -679,7 +724,7 @@ public partial class Form1 : Form
     {
         if (bytesPerSecond <= 0)
         {
-            return "0 KB/s";
+            return "0 B/s";
         }
 
         var kibPerSecond = bytesPerSecond / 1024d;
@@ -913,6 +958,7 @@ public partial class Form1 : Form
 
             state.CommandLine = commandLine;
             processCommandLineCache[state.ProcessId] = commandLine;
+            UpdateActiveProcessHistory(state, DateTime.UtcNow);
             InvalidateCommandLineColumn();
             return commandLine;
         }
@@ -960,13 +1006,14 @@ public partial class Form1 : Form
         {
             var entries = await Task.Run(() => StartupReader.ReadStartupEntries()
                 .OrderBy(entry => entry.Scope)
+                .ThenBy(entry => entry.Type)
                 .ThenBy(entry => entry.Name, StringComparer.OrdinalIgnoreCase)
                 .ToList());
 
             startupGrid.Rows.Clear();
             foreach (var entry in entries)
             {
-                startupGrid.Rows.Add(entry.Name, entry.Scope, entry.Type, entry.Location, entry.Command);
+                startupGrid.Rows.Add(entry.Name, entry.Scope, entry.Type, entry.LastRunTime, entry.NextExecutionTime, entry.Location, entry.Command);
             }
 
             startupStatusLabel.Text = $"Startup items: {startupGrid.Rows.Count}";
@@ -974,12 +1021,118 @@ public partial class Form1 : Form
         catch (Exception ex)
         {
             startupStatusLabel.Text = $"Startup refresh failed: {ex.Message}";
-            LogCall("Startup", "Refresh Failed", ex.Message);
         }
         finally
         {
             isRefreshingStartup = false;
             refreshStartupButton.Enabled = true;
+        }
+    }
+
+    private async Task RefreshScheduledTasksAsync()
+    {
+        if (isRefreshingTasks)
+        {
+            return;
+        }
+
+        isRefreshingTasks = true;
+        refreshTasksButton.Enabled = false;
+
+        try
+        {
+            var entries = await Task.Run(() => StartupReader.ReadScheduledTaskStartupEntries()
+                .OrderBy(entry => entry.Name, StringComparer.OrdinalIgnoreCase)
+                .ToList());
+
+            tasksGrid.Rows.Clear();
+            foreach (var entry in entries)
+            {
+                tasksGrid.Rows.Add(entry.Name, entry.LastRunTime, entry.NextExecutionTime, entry.Command);
+            }
+
+            tasksStatusLabel.Text = $"Scheduled startup tasks: {tasksGrid.Rows.Count}";
+        }
+        catch (Exception ex)
+        {
+            tasksStatusLabel.Text = $"Scheduled task refresh failed: {ex.Message}";
+            LogCall("Tasks", "Refresh Failed", ex.Message);
+        }
+        finally
+        {
+            isRefreshingTasks = false;
+            refreshTasksButton.Enabled = true;
+        }
+    }
+
+    private async Task RefreshConnectionsAsync(IReadOnlyDictionary<int, ProcessSnapshot> currentSnapshot)
+    {
+        if (isRefreshingConnections)
+        {
+            return;
+        }
+
+        isRefreshingConnections = true;
+
+        try
+        {
+            var snapshots = await Task.Run(() => NativeProcessMethods.ReadActiveTcpConnections());
+            var seenAt = DateTime.Now;
+
+            foreach (var snapshot in snapshots)
+            {
+                var key = new ConnectionRecordKey(snapshot.ProcessId, snapshot.Protocol, snapshot.RemoteAddress, snapshot.RemotePort);
+                var binaryPath = currentSnapshot.TryGetValue(snapshot.ProcessId, out var processSnapshot) && !string.IsNullOrWhiteSpace(processSnapshot.ExecutablePath)
+                    ? processSnapshot.ExecutablePath!
+                    : NativeProcessMethods.TryGetProcessPath(snapshot.ProcessId) ?? $"pid-{snapshot.ProcessId}";
+                var binaryName = Path.GetFileName(binaryPath);
+                var uploadValue = currentSnapshot.TryGetValue(snapshot.ProcessId, out var networkSnapshot)
+                    ? FormatThroughputColumn(networkSnapshot.NetworkUploadBytesPerSecond)
+                    : "0 B/s";
+                var downloadValue = currentSnapshot.TryGetValue(snapshot.ProcessId, out networkSnapshot)
+                    ? FormatThroughputColumn(networkSnapshot.NetworkDownloadBytesPerSecond)
+                    : "0 B/s";
+                var dnsName = snapshot.RemoteAddress;
+
+                if (!connectionRecords.TryGetValue(key, out var record))
+                {
+                    record = new ConnectionRecord(
+                        key,
+                        snapshot.ProcessId,
+                        binaryName,
+                        binaryPath,
+                        dnsName,
+                        snapshot.RemoteAddress,
+                        uploadValue,
+                        downloadValue,
+                        seenAt,
+                        seenAt);
+                    connectionRecords[key] = record;
+                    QueueDnsLookup(snapshot.RemoteAddress, key);
+                }
+                else
+                {
+                    connectionRecords[key] = record with
+                    {
+                        ProcessId = snapshot.ProcessId,
+                        BinaryName = binaryName,
+                        BinaryPath = binaryPath,
+                        Upload = uploadValue,
+                        Download = downloadValue,
+                        LastSeenLocal = seenAt
+                    };
+                }
+            }
+
+            UpdateConnectionGrid();
+        }
+        catch (Exception ex)
+        {
+            callsStatusLabel.Text = $"Network refresh failed: {ex.Message}";
+        }
+        finally
+        {
+            isRefreshingConnections = false;
         }
     }
 
@@ -995,7 +1148,10 @@ public partial class Form1 : Form
 
         try
         {
-            var entries = await Task.Run(() => ServiceReader.ReadServices().ToList());
+            var entries = await Task.Run(() => ServiceReader.ReadServices()
+                .OrderBy(entry => entry.StartType, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(entry => entry.DisplayName, StringComparer.OrdinalIgnoreCase)
+                .ToList());
             servicesGrid.Rows.Clear();
 
             foreach (var entry in entries)
@@ -1009,7 +1165,6 @@ public partial class Form1 : Form
         catch (Exception ex)
         {
             servicesStatusLabel.Text = $"Services refresh failed: {ex.Message}";
-            LogCall("Services", "Refresh Failed", ex.Message);
         }
         finally
         {
@@ -1040,13 +1195,11 @@ public partial class Form1 : Form
                 controller.WaitForStatus(System.ServiceProcess.ServiceControllerStatus.Stopped, TimeSpan.FromSeconds(5));
             }
 
-            LogCall("Services", action.ToString(), entry.DisplayName);
             _ = RefreshServicesAsync();
         }
         catch (Exception ex)
         {
             MessageBox.Show(this, $"Unable to {action.ToString().ToLowerInvariant()} service {entry.DisplayName}.\n\n{ex.Message}", "Service Action Failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            LogCall("Services", $"{action} Failed", $"{entry.DisplayName}: {ex.Message}");
         }
     }
 
@@ -1063,35 +1216,458 @@ public partial class Form1 : Form
         stopServiceButton.Enabled = entry.Status.Equals("Running", StringComparison.OrdinalIgnoreCase);
     }
 
-    private void LogCall(string area, string action, string details)
+    private void UpdateConnectionGrid()
     {
-        callsGrid.Rows.Insert(0, DateTime.Now.ToString("HH:mm:ss"), area, action, details);
+        callsGrid.Rows.Clear();
 
-        while (callsGrid.Rows.Count > 250)
+        foreach (var record in connectionRecords.Values.OrderByDescending(record => record.LastSeenLocal).ThenBy(record => record.BinaryName, StringComparer.OrdinalIgnoreCase))
         {
-            callsGrid.Rows.RemoveAt(callsGrid.Rows.Count - 1);
+            callsGrid.Rows.Add(
+                record.BinaryName,
+                record.DnsName,
+                record.RemoteAddress,
+                record.Upload,
+                record.Download);
         }
 
-        UpdateCallsStatus();
+        UpdateConnectionStatus();
     }
 
-    private void UpdateCallsStatus()
+    private void UpdateConnectionStatus()
     {
-        callsStatusLabel.Text = $"Calls logged: {callsGrid.Rows.Count}";
+        callsStatusLabel.Text = $"Network records: {connectionRecords.Count} | Upload/Download counters currently unavailable";
+    }
+
+    private void TrackProcessHistory(ProcessNodeState state, DateTime seenUtc)
+    {
+        if (activeProcessHistoryEntries.ContainsKey(state.ProcessId))
+        {
+            UpdateActiveProcessHistory(state, seenUtc);
+            return;
+        }
+
+        var entry = new ProcessHistoryEntry(
+            nextProcessHistoryId++,
+            state.ProcessId,
+            state.ParentProcessId,
+            state.ParentProcessId.HasValue && activeProcessHistoryEntries.TryGetValue(state.ParentProcessId.Value, out var parentHistoryEntry)
+                ? parentHistoryEntry.Id
+                : null,
+            state.Name,
+            state.ProcessName,
+            state.ExecutablePath ?? "Unavailable",
+            string.IsNullOrWhiteSpace(state.CommandLine) ? "Unavailable" : state.CommandLine,
+            seenUtc.ToLocalTime(),
+            null,
+            state.WasSeenAfterLaunch,
+            "Running");
+        processHistoryEntries.Add(entry);
+        activeProcessHistoryEntries[state.ProcessId] = entry;
+        ExpandProcessHistoryAncestors(entry.ParentHistoryId);
+    }
+
+    private void UpdateActiveProcessHistory(ProcessNodeState state, DateTime seenUtc)
+    {
+        if (!activeProcessHistoryEntries.TryGetValue(state.ProcessId, out var entry))
+        {
+            TrackProcessHistory(state, seenUtc);
+            return;
+        }
+
+        entry.Name = state.Name;
+        entry.ProcessName = state.ProcessName;
+        entry.ParentProcessId = state.ParentProcessId;
+        if (state.ParentProcessId.HasValue && activeProcessHistoryEntries.TryGetValue(state.ParentProcessId.Value, out var parentHistoryEntry))
+        {
+            entry.ParentHistoryId = parentHistoryEntry.Id;
+        }
+        entry.BinaryPath = string.IsNullOrWhiteSpace(state.ExecutablePath) ? entry.BinaryPath : state.ExecutablePath!;
+        if (!string.IsNullOrWhiteSpace(state.CommandLine))
+        {
+            entry.CommandLine = state.CommandLine;
+        }
+    }
+
+    private void MarkProcessHistoryExited(int processId, DateTime exitedUtc)
+    {
+        if (!activeProcessHistoryEntries.TryGetValue(processId, out var entry))
+        {
+            return;
+        }
+
+        entry.ClosedAtLocal = exitedUtc.ToLocalTime();
+        entry.Status = "Closed";
+        activeProcessHistoryEntries.Remove(processId);
+    }
+
+    private void RenderProcessHistoryGrid()
+    {
+        var selectedHistoryId = GetSelectedProcessHistoryId();
+        var firstDisplayedRowIndex = GetFirstDisplayedProcessHistoryRowIndex();
+        var filter = processHistorySearchTextBox.Text.Trim();
+        var filteredEntries = processHistoryEntries
+            .Where(entry => MatchesProcessHistory(entry, filter))
+            .ToList();
+
+        var visibleHistoryIds = filteredEntries.Select(entry => entry.Id).ToHashSet();
+        var childrenByParent = filteredEntries
+            .GroupBy(entry => entry.ParentHistoryId)
+            .ToDictionary(group => group.Key ?? 0L, group => group.ToList());
+        var latestActivityByHistoryId = new Dictionary<long, DateTime>();
+
+        var rootEntries = filteredEntries
+            .Where(entry => entry.ParentHistoryId is null
+                || !visibleHistoryIds.Contains(entry.ParentHistoryId.Value))
+            .OrderByDescending(entry => GetLatestProcessHistoryActivity(entry, childrenByParent, latestActivityByHistoryId, []))
+            .ThenBy(entry => entry.Name, StringComparer.OrdinalIgnoreCase)
+            .ThenByDescending(entry => entry.Id)
+            .ToList();
+
+        foreach (var childList in childrenByParent.Values)
+        {
+            childList.Sort((left, right) =>
+            {
+                var latestComparison = GetLatestProcessHistoryActivity(right, childrenByParent, latestActivityByHistoryId, [])
+                    .CompareTo(GetLatestProcessHistoryActivity(left, childrenByParent, latestActivityByHistoryId, []));
+                if (latestComparison != 0)
+                {
+                    return latestComparison;
+                }
+
+                var nameComparison = string.Compare(left.Name, right.Name, StringComparison.OrdinalIgnoreCase);
+                return nameComparison != 0
+                    ? nameComparison
+                    : right.Id.CompareTo(left.Id);
+            });
+        }
+
+        processHistoryGrid.SuspendLayout();
+        processHistoryRows.Clear();
+        foreach (var entry in rootEntries)
+        {
+            AddProcessHistoryRows(entry, 0, childrenByParent, [], processHistoryRows, collapsedProcessHistoryIds);
+        }
+
+        processHistoryGrid.Rows.Clear();
+        foreach (var rowEntry in processHistoryRows)
+        {
+            var rowIndex = processHistoryGrid.Rows.Add(
+                FormatHistoryName(rowEntry),
+                rowEntry.Entry.ProcessName,
+                rowEntry.Entry.ProcessId,
+                rowEntry.Entry.StartedAtLocal.ToString("yyyy-MM-dd HH:mm:ss"),
+                rowEntry.Entry.ClosedAtLocal?.ToString("yyyy-MM-dd HH:mm:ss") ?? "-",
+                rowEntry.Entry.Status,
+                rowEntry.Entry.BinaryPath,
+                rowEntry.Entry.CommandLine);
+            processHistoryGrid.Rows[rowIndex].Tag = rowEntry.Entry;
+        }
+        RestoreProcessHistorySelection(selectedHistoryId);
+        RestoreProcessHistoryScrollPosition(firstDisplayedRowIndex);
+        processHistoryGrid.ResumeLayout();
+
+        processHistoryStatusLabel.Text = $"Process history: {filteredEntries.Count} shown, {processHistoryEntries.Count} total";
+    }
+
+    private static void AddProcessHistoryRows(
+        ProcessHistoryEntry entry,
+        int depth,
+        IReadOnlyDictionary<long, List<ProcessHistoryEntry>> childrenByParent,
+        HashSet<long> ancestry,
+        ICollection<ProcessHistoryRowEntry> rows,
+        ISet<long> collapsedHistoryIds)
+    {
+        if (!ancestry.Add(entry.Id))
+        {
+            return;
+        }
+
+        childrenByParent.TryGetValue(entry.Id, out var children);
+        var hasChildren = children is { Count: > 0 };
+        var isExpanded = hasChildren && !collapsedHistoryIds.Contains(entry.Id);
+        rows.Add(new ProcessHistoryRowEntry(entry, depth, hasChildren, isExpanded));
+
+        if (hasChildren && isExpanded && children is not null)
+        {
+            foreach (var child in children)
+            {
+                if (ancestry.Contains(child.Id))
+                {
+                    continue;
+                }
+
+                AddProcessHistoryRows(child, depth + 1, childrenByParent, [.. ancestry], rows, collapsedHistoryIds);
+            }
+        }
+    }
+
+    private static string FormatHistoryName(ProcessHistoryRowEntry rowEntry)
+    {
+        var glyph = rowEntry.HasChildren
+            ? rowEntry.IsExpanded ? "- " : "+ "
+            : "  ";
+        var prefix = rowEntry.Depth == 0
+            ? glyph
+            : string.Concat(Enumerable.Repeat("   ", rowEntry.Depth)) + glyph;
+        return prefix + rowEntry.Entry.Name;
+    }
+
+    private static bool MatchesProcessHistory(ProcessHistoryEntry entry, string filter)
+    {
+        if (string.IsNullOrWhiteSpace(filter))
+        {
+            return true;
+        }
+
+        return entry.Name.Contains(filter, StringComparison.OrdinalIgnoreCase)
+            || entry.ProcessName.Contains(filter, StringComparison.OrdinalIgnoreCase)
+            || entry.ProcessId.ToString().Contains(filter, StringComparison.OrdinalIgnoreCase)
+            || entry.Status.Contains(filter, StringComparison.OrdinalIgnoreCase)
+            || entry.BinaryPath.Contains(filter, StringComparison.OrdinalIgnoreCase)
+            || entry.CommandLine.Contains(filter, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private void ExpandProcessHistoryAncestors(long? parentHistoryId)
+    {
+        var currentParentHistoryId = parentHistoryId;
+        while (currentParentHistoryId.HasValue)
+        {
+            var parentEntry = processHistoryEntries.FirstOrDefault(entry => entry.Id == currentParentHistoryId.Value);
+            if (parentEntry is null)
+            {
+                break;
+            }
+
+            collapsedProcessHistoryIds.Remove(parentEntry.Id);
+            currentParentHistoryId = parentEntry.ParentHistoryId;
+        }
+    }
+
+    private static DateTime GetLatestProcessHistoryActivity(
+        ProcessHistoryEntry entry,
+        IReadOnlyDictionary<long, List<ProcessHistoryEntry>> childrenByParent,
+        IDictionary<long, DateTime> cache,
+        HashSet<long> ancestry)
+    {
+        if (cache.TryGetValue(entry.Id, out var cached))
+        {
+            return cached;
+        }
+
+        if (!ancestry.Add(entry.Id))
+        {
+            return entry.ClosedAtLocal ?? entry.StartedAtLocal;
+        }
+
+        var latest = entry.ClosedAtLocal ?? entry.StartedAtLocal;
+        if (childrenByParent.TryGetValue(entry.Id, out var children))
+        {
+            foreach (var child in children)
+            {
+                var childLatest = GetLatestProcessHistoryActivity(child, childrenByParent, cache, ancestry);
+                if (childLatest > latest)
+                {
+                    latest = childLatest;
+                }
+            }
+        }
+
+        ancestry.Remove(entry.Id);
+        cache[entry.Id] = latest;
+        return latest;
+    }
+
+    private void LogCall(string area, string action, string details)
+    {
+        Debug.WriteLine($"{DateTime.Now:HH:mm:ss} [{area}] {action}: {details}");
+    }
+
+    private long? GetSelectedProcessHistoryId()
+    {
+        return processHistoryGrid.CurrentRow?.Tag is ProcessHistoryEntry entry
+            ? entry.Id
+            : null;
+    }
+
+    private int GetFirstDisplayedProcessHistoryRowIndex()
+    {
+        try
+        {
+            return processHistoryGrid.FirstDisplayedScrollingRowIndex >= 0
+                ? processHistoryGrid.FirstDisplayedScrollingRowIndex
+                : 0;
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+
+    private void RestoreProcessHistorySelection(long? selectedHistoryId)
+    {
+        if (processHistoryGrid.Rows.Count == 0)
+        {
+            return;
+        }
+
+        if (selectedHistoryId is null)
+        {
+            return;
+        }
+
+        foreach (DataGridViewRow row in processHistoryGrid.Rows)
+        {
+            if (row.Tag is ProcessHistoryEntry entry && entry.Id == selectedHistoryId.Value)
+            {
+                processHistoryGrid.CurrentCell = processHistoryGrid[0, row.Index];
+                return;
+            }
+        }
+    }
+
+    private void RestoreProcessHistoryScrollPosition(int firstDisplayedRowIndex)
+    {
+        if (processHistoryGrid.Rows.Count == 0)
+        {
+            return;
+        }
+
+        var safeIndex = Math.Max(0, Math.Min(firstDisplayedRowIndex, processHistoryGrid.Rows.Count - 1));
+        try
+        {
+            processHistoryGrid.FirstDisplayedScrollingRowIndex = safeIndex;
+        }
+        catch
+        {
+        }
+    }
+
+    private void processHistoryGrid_CellFormatting(object? sender, DataGridViewCellFormattingEventArgs e)
+    {
+        if (e.RowIndex < 0 || processHistoryGrid.Rows[e.RowIndex].Tag is not ProcessHistoryEntry entry)
+        {
+            return;
+        }
+
+        var statusColor = entry.Status.Equals("Closed", StringComparison.OrdinalIgnoreCase)
+            ? Color.FromArgb(220, 110, 110)
+            : entry.WasSeenAfterLaunch
+                ? Color.FromArgb(94, 234, 150)
+                : entry.ParentHistoryId is null
+                    ? Color.FromArgb(96, 165, 250)
+                : Color.FromArgb(203, 213, 225);
+
+        var statusColumn = processHistoryGrid.Columns["HistoryStatus"];
+        if (statusColumn is not null && e.ColumnIndex == statusColumn.Index)
+        {
+            e.CellStyle.ForeColor = statusColor;
+        }
+
+        var nameColumn = processHistoryGrid.Columns["HistoryName"];
+        if (nameColumn is not null && e.ColumnIndex == nameColumn.Index)
+        {
+            e.CellStyle.ForeColor = statusColor;
+        }
+    }
+
+    private void processHistoryGrid_CellMouseClick(object? sender, DataGridViewCellMouseEventArgs e)
+    {
+        if (e.RowIndex < 0)
+        {
+            return;
+        }
+
+        var nameColumn = processHistoryGrid.Columns["HistoryName"];
+        if (nameColumn is null || e.ColumnIndex != nameColumn.Index)
+        {
+            return;
+        }
+
+        if (!TryGetProcessHistoryRow(e.RowIndex, out var rowEntry) || !rowEntry.HasChildren)
+        {
+            return;
+        }
+
+        ToggleProcessHistoryExpansion(rowEntry.Entry.Id);
+    }
+
+    private bool TryGetProcessHistoryRow(int rowIndex, out ProcessHistoryRowEntry rowEntry)
+    {
+        if (rowIndex >= 0 && rowIndex < processHistoryRows.Count)
+        {
+            rowEntry = processHistoryRows[rowIndex];
+            return true;
+        }
+
+        rowEntry = default;
+        return false;
+    }
+
+    private void ToggleProcessHistoryExpansion(long historyId)
+    {
+        if (!collapsedProcessHistoryIds.Add(historyId))
+        {
+            collapsedProcessHistoryIds.Remove(historyId);
+        }
+
+        RenderProcessHistoryGrid();
     }
 
     private void UpdateTabButtons()
     {
         StyleTabButton(processesTabButton, mainTabControl.SelectedTab == processesTabPage);
+        StyleTabButton(processHistoryTabButton, mainTabControl.SelectedTab == processHistoryTabPage);
         StyleTabButton(startupTabButton, mainTabControl.SelectedTab == startupTabPage);
+        StyleTabButton(tasksTabButton, mainTabControl.SelectedTab == tasksTabPage);
         StyleTabButton(servicesTabButton, mainTabControl.SelectedTab == servicesTabPage);
-        StyleTabButton(callsTabButton, mainTabControl.SelectedTab == callsTabPage);
+        StyleTabButton(conTabButton, mainTabControl.SelectedTab == conTabPage);
     }
 
     private static void StyleTabButton(Button button, bool isSelected)
     {
-        button.BackColor = isSelected ? Color.FromArgb(30, 41, 59) : Color.FromArgb(15, 22, 30);
-        button.ForeColor = isSelected ? Color.FromArgb(241, 245, 249) : Color.FromArgb(148, 163, 184);
+        button.BackColor = isSelected ? Color.FromArgb(39, 39, 39) : Color.FromArgb(25, 25, 25);
+        button.ForeColor = isSelected ? Color.FromArgb(245, 245, 245) : Color.FromArgb(170, 170, 175);
+    }
+
+    private void QueueDnsLookup(string remoteAddress, ConnectionRecordKey key)
+    {
+        if (string.IsNullOrWhiteSpace(remoteAddress)
+            || remoteAddress is "0.0.0.0" or "::" or "::1" or "127.0.0.1"
+            || !pendingDnsLookups.Add(remoteAddress))
+        {
+            return;
+        }
+
+        _ = Task.Run(() =>
+        {
+            string resolvedHost;
+            try
+            {
+                resolvedHost = System.Net.Dns.GetHostEntry(remoteAddress).HostName;
+                if (string.IsNullOrWhiteSpace(resolvedHost))
+                {
+                    resolvedHost = remoteAddress;
+                }
+            }
+            catch
+            {
+                resolvedHost = remoteAddress;
+            }
+
+            pendingDnsLookups.Remove(remoteAddress);
+            if (!connectionRecords.TryGetValue(key, out var existing))
+            {
+                return;
+            }
+
+            connectionRecords[key] = existing with { DnsName = resolvedHost };
+            if (!IsHandleCreated)
+            {
+                return;
+            }
+
+            BeginInvoke(UpdateConnectionGrid);
+        });
     }
 
     private static void SuspendControlDrawing(Control control)
@@ -1137,6 +1713,103 @@ public partial class Form1 : Form
         return false;
     }
 
+    private void SortProcessStates(List<ProcessNodeState> states)
+    {
+        states.Sort(CompareProcessStates);
+    }
+
+    private int CompareProcessStates(ProcessNodeState? left, ProcessNodeState? right)
+    {
+        if (ReferenceEquals(left, right))
+        {
+            return 0;
+        }
+
+        if (left is null)
+        {
+            return -1;
+        }
+
+        if (right is null)
+        {
+            return 1;
+        }
+
+        var result = processSortColumnName switch
+        {
+            "NameColumn" => CompareText(left.Name, right.Name),
+            "ProcessNameColumn" => CompareText(left.ProcessName, right.ProcessName),
+            "PidColumn" => left.ProcessId.CompareTo(right.ProcessId),
+            "CpuColumn" => left.CpuPercent.CompareTo(right.CpuPercent),
+            "MemoryColumn" => left.WorkingSetBytes.CompareTo(right.WorkingSetBytes),
+            "GpuColumn" => left.GpuPercent.CompareTo(right.GpuPercent),
+            "DiskColumn" => left.DiskBytesPerSecond.CompareTo(right.DiskBytesPerSecond),
+            "NetworkColumn" => CompareNetwork(left, right),
+            "StatusColumn" => CompareStatus(left, right),
+            "CommandLineColumn" => CompareText(left.CommandLine, right.CommandLine),
+            _ => 0
+        };
+
+        if (result == 0)
+        {
+            result = left.IsExited.CompareTo(right.IsExited);
+        }
+
+        if (result == 0)
+        {
+            result = CompareText(left.Name, right.Name);
+        }
+
+        if (result == 0)
+        {
+            result = left.ProcessId.CompareTo(right.ProcessId);
+        }
+
+        return processSortOrder == SortOrder.Descending
+            ? -result
+            : result;
+    }
+
+    private static int CompareText(string? left, string? right)
+    {
+        return string.Compare(left ?? string.Empty, right ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static int CompareNetwork(ProcessNodeState left, ProcessNodeState right)
+    {
+        var throughputComparison = left.NetworkBytesPerSecond.CompareTo(right.NetworkBytesPerSecond);
+        return throughputComparison != 0
+            ? throughputComparison
+            : left.NetworkConnectionCount.CompareTo(right.NetworkConnectionCount);
+    }
+
+    private static int CompareStatus(ProcessNodeState left, ProcessNodeState right)
+    {
+        if (left.IsExited != right.IsExited)
+        {
+            return left.IsExited.CompareTo(right.IsExited);
+        }
+
+        if (left.WasSeenAfterLaunch != right.WasSeenAfterLaunch)
+        {
+            return right.WasSeenAfterLaunch.CompareTo(left.WasSeenAfterLaunch);
+        }
+
+        var leftIsRoot = left.ParentProcessId is null || left.ParentProcessId == left.ProcessId;
+        var rightIsRoot = right.ParentProcessId is null || right.ParentProcessId == right.ProcessId;
+        return rightIsRoot.CompareTo(leftIsRoot);
+    }
+
+    private void UpdateProcessSortGlyphs()
+    {
+        foreach (DataGridViewColumn column in processGrid.Columns)
+        {
+            column.HeaderCell.SortGlyphDirection = processSortColumnName == column.Name
+                ? processSortOrder
+                : SortOrder.None;
+        }
+    }
+
     private static void EnableDoubleBuffering(DataGridView grid)
     {
         typeof(DataGridView)
@@ -1171,6 +1844,22 @@ internal sealed class DarkMenuRenderer : ToolStripProfessionalRenderer
     }
 }
 
+internal sealed class BorderlessTabControl : TabControl
+{
+    private const int TcmAdjustRect = 0x1328;
+
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == TcmAdjustRect && !DesignMode)
+        {
+            m.Result = 1;
+            return;
+        }
+
+        base.WndProc(ref m);
+    }
+}
+
 internal sealed class DarkColorTable : ProfessionalColorTable
 {
     public override Color MenuStripGradientBegin => Color.FromArgb(15, 22, 30);
@@ -1191,6 +1880,65 @@ internal sealed class DarkColorTable : ProfessionalColorTable
 }
 
 internal readonly record struct ProcessRowEntry(ProcessNodeState State, int Depth, bool HasChildren, bool IsExpanded);
+
+internal readonly record struct ProcessHistoryRowEntry(ProcessHistoryEntry Entry, int Depth, bool HasChildren, bool IsExpanded);
+
+internal sealed class ProcessHistoryEntry
+{
+    public ProcessHistoryEntry(long id, int processId, int? parentProcessId, long? parentHistoryId, string name, string processName, string binaryPath, string commandLine, DateTime startedAtLocal, DateTime? closedAtLocal, bool wasSeenAfterLaunch, string status)
+    {
+        Id = id;
+        ProcessId = processId;
+        ParentProcessId = parentProcessId;
+        ParentHistoryId = parentHistoryId;
+        Name = name;
+        ProcessName = processName;
+        BinaryPath = binaryPath;
+        CommandLine = commandLine;
+        StartedAtLocal = startedAtLocal;
+        ClosedAtLocal = closedAtLocal;
+        WasSeenAfterLaunch = wasSeenAfterLaunch;
+        Status = status;
+    }
+
+    public long Id { get; }
+
+    public int ProcessId { get; }
+
+    public int? ParentProcessId { get; set; }
+
+    public long? ParentHistoryId { get; set; }
+
+    public string Name { get; set; }
+
+    public string ProcessName { get; set; }
+
+    public string BinaryPath { get; set; }
+
+    public string CommandLine { get; set; }
+
+    public DateTime StartedAtLocal { get; }
+
+    public DateTime? ClosedAtLocal { get; set; }
+
+    public bool WasSeenAfterLaunch { get; }
+
+    public string Status { get; set; }
+}
+
+internal readonly record struct ConnectionRecordKey(int ProcessId, string Protocol, string RemoteAddress, int RemotePort);
+
+internal sealed record ConnectionRecord(
+    ConnectionRecordKey Key,
+    int ProcessId,
+    string BinaryName,
+    string BinaryPath,
+    string DnsName,
+    string RemoteAddress,
+    string Upload,
+    string Download,
+    DateTime FirstSeenLocal,
+    DateTime LastSeenLocal);
 
 internal sealed class ProcessNodeState
 {
@@ -1418,6 +2166,8 @@ internal sealed record ProcessSnapshot(
     long WorkingSetBytes,
     double GpuPercent,
     double DiskBytesPerSecond,
+    double NetworkUploadBytesPerSecond,
+    double NetworkDownloadBytesPerSecond,
     double NetworkBytesPerSecond,
     int NetworkConnectionCount,
     TimeSpan TotalProcessorTime);
@@ -1450,6 +2200,8 @@ internal static class ProcessSnapshotReader
                     workingSet,
                     metrics.GpuPercent,
                     metrics.DiskBytesPerSecond,
+                    metrics.NetworkUploadBytesPerSecond,
+                    metrics.NetworkDownloadBytesPerSecond,
                     metrics.NetworkBytesPerSecond,
                     metrics.ConnectionCount,
                     totalProcessorTime);
@@ -1472,13 +2224,20 @@ internal static class ProcessSnapshotReader
     }
 }
 
-internal readonly record struct ProcessRuntimeMetrics(double DiskBytesPerSecond, double NetworkBytesPerSecond, int ConnectionCount, double GpuPercent);
+internal readonly record struct ProcessRuntimeMetrics(
+    double DiskBytesPerSecond,
+    double NetworkUploadBytesPerSecond,
+    double NetworkDownloadBytesPerSecond,
+    double NetworkBytesPerSecond,
+    int ConnectionCount,
+    double GpuPercent);
 
 internal sealed class ProcessRuntimeMetricsProvider : IDisposable
 {
     private readonly object sync = new();
     private readonly Dictionary<int, (ulong Bytes, DateTime SampleUtc)> lastDiskSamples = [];
     private readonly Dictionary<string, CounterSample> lastGpuSamples = new(StringComparer.OrdinalIgnoreCase);
+    private readonly NetworkUsageMonitor networkUsageMonitor = new();
     private readonly bool gpuCountersAvailable;
 
     public ProcessRuntimeMetricsProvider()
@@ -1499,6 +2258,7 @@ internal sealed class ProcessRuntimeMetricsProvider : IDisposable
         {
             var connectionCounts = NativeProcessMethods.ReadNetworkConnectionCounts();
             var gpuPercents = gpuCountersAvailable ? ReadGpuUsage() : new Dictionary<int, double>();
+            var networkRates = networkUsageMonitor.ReadCurrentRates();
             var metrics = new Dictionary<int, ProcessRuntimeMetrics>();
             var sampledAtUtc = DateTime.UtcNow;
 
@@ -1513,15 +2273,19 @@ internal sealed class ProcessRuntimeMetricsProvider : IDisposable
 
                     connectionCounts.TryGetValue(pid, out var connectionCount);
                     gpuPercents.TryGetValue(pid, out var gpuPercent);
+                    networkRates.TryGetValue(pid, out var networkRate);
 
                     metrics[pid] = new ProcessRuntimeMetrics(
                         diskRate,
-                        0d,
+                        networkRate.UploadBytesPerSecond,
+                        networkRate.DownloadBytesPerSecond,
+                        networkRate.TotalBytesPerSecond,
                         connectionCount,
                         gpuPercent);
                 }
             }
 
+            networkUsageMonitor.CleanupState(metrics.Keys);
             CleanupState(metrics.Keys);
             return metrics;
         }
@@ -1529,6 +2293,7 @@ internal sealed class ProcessRuntimeMetricsProvider : IDisposable
 
     public void Dispose()
     {
+        networkUsageMonitor.Dispose();
     }
 
     private double ComputeDiskBytesPerSecond(int pid, ulong totalDiskBytes, DateTime sampledAtUtc)
@@ -1635,7 +2400,159 @@ internal sealed class ProcessRuntimeMetricsProvider : IDisposable
     }
 }
 
-internal sealed record StartupEntry(string Name, string Scope, string Type, string Location, string Command);
+internal readonly record struct ProcessNetworkRate(double UploadBytesPerSecond, double DownloadBytesPerSecond, double TotalBytesPerSecond);
+
+internal sealed class NetworkUsageMonitor : IDisposable
+{
+    private readonly object sync = new();
+    private readonly Dictionary<int, (ulong UploadBytes, ulong DownloadBytes)> cumulativeBytes = [];
+    private readonly Dictionary<int, (ulong UploadBytes, ulong DownloadBytes, DateTime SampleUtc)> lastSamples = [];
+    private readonly string sessionName = $"TaskManager-Network-{Environment.ProcessId}";
+    private TraceEventSession? session;
+    private Task? processingTask;
+    private bool started;
+
+    public IReadOnlyDictionary<int, ProcessNetworkRate> ReadCurrentRates()
+    {
+        EnsureStarted();
+
+        lock (sync)
+        {
+            var sampledAtUtc = DateTime.UtcNow;
+            var rates = new Dictionary<int, ProcessNetworkRate>(cumulativeBytes.Count);
+
+            foreach (var (pid, totals) in cumulativeBytes)
+            {
+                var uploadRate = 0d;
+                var downloadRate = 0d;
+
+                if (lastSamples.TryGetValue(pid, out var previous))
+                {
+                    var elapsedSeconds = (sampledAtUtc - previous.SampleUtc).TotalSeconds;
+                    if (elapsedSeconds > 0)
+                    {
+                        if (totals.UploadBytes >= previous.UploadBytes)
+                        {
+                            uploadRate = (totals.UploadBytes - previous.UploadBytes) / elapsedSeconds;
+                        }
+
+                        if (totals.DownloadBytes >= previous.DownloadBytes)
+                        {
+                            downloadRate = (totals.DownloadBytes - previous.DownloadBytes) / elapsedSeconds;
+                        }
+                    }
+                }
+
+                lastSamples[pid] = (totals.UploadBytes, totals.DownloadBytes, sampledAtUtc);
+                rates[pid] = new ProcessNetworkRate(uploadRate, downloadRate, uploadRate + downloadRate);
+            }
+
+            return rates;
+        }
+    }
+
+    public void CleanupState(IEnumerable<int> activePids)
+    {
+        lock (sync)
+        {
+            var activePidSet = activePids.ToHashSet();
+            foreach (var stalePid in cumulativeBytes.Keys.Where(pid => !activePidSet.Contains(pid)).ToArray())
+            {
+                cumulativeBytes.Remove(stalePid);
+                lastSamples.Remove(stalePid);
+            }
+        }
+    }
+
+    public void Dispose()
+    {
+        try
+        {
+            session?.Dispose();
+        }
+        catch
+        {
+        }
+
+        if (processingTask is { IsCompleted: false })
+        {
+            try
+            {
+                processingTask.Wait(TimeSpan.FromSeconds(1));
+            }
+            catch
+            {
+            }
+        }
+    }
+
+    private void EnsureStarted()
+    {
+        if (started || !RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            return;
+        }
+
+        started = true;
+
+        try
+        {
+            if (TraceEventSession.IsElevated() == false)
+            {
+                return;
+            }
+
+            session = new TraceEventSession(sessionName, null)
+            {
+                StopOnDispose = true
+            };
+            session.EnableKernelProvider(KernelTraceEventParser.Keywords.NetworkTCPIP);
+
+            processingTask = Task.Run(() =>
+            {
+                try
+                {
+                    session.Source.Kernel.TcpIpSend += data => RecordTransfer(data.ProcessID, checked((uint)data.size), isUpload: true);
+                    session.Source.Kernel.TcpIpRecv += data => RecordTransfer(data.ProcessID, checked((uint)data.size), isUpload: false);
+                    session.Source.Process();
+                }
+                catch
+                {
+                }
+            });
+        }
+        catch
+        {
+            try
+            {
+                session?.Dispose();
+            }
+            catch
+            {
+            }
+
+            session = null;
+        }
+    }
+
+    private void RecordTransfer(int processId, uint bytes, bool isUpload)
+    {
+        if (processId <= 0 || bytes == 0)
+        {
+            return;
+        }
+
+        lock (sync)
+        {
+            cumulativeBytes.TryGetValue(processId, out var totals);
+            cumulativeBytes[processId] = isUpload
+                ? (totals.UploadBytes + bytes, totals.DownloadBytes)
+                : (totals.UploadBytes, totals.DownloadBytes + bytes);
+        }
+    }
+}
+
+internal sealed record StartupEntry(string Name, string Scope, string Type, string Location, string Command, string LastRunTime, string NextExecutionTime);
 
 internal static class StartupReader
 {
@@ -1662,19 +2579,33 @@ internal static class StartupReader
         }
     }
 
+    public static IEnumerable<StartupEntry> ReadScheduledTaskStartupEntries()
+    {
+        return ReadScheduledStartupTasks();
+    }
+
     private static IEnumerable<StartupEntry> ReadStandardRegistryLocations()
     {
         var locations = new (RegistryHive Hive, RegistryView View, string SubKeyPath, string Scope, string Type)[]
         {
             (RegistryHive.CurrentUser, RegistryView.Default, @"Software\Microsoft\Windows\CurrentVersion\Run", "Current user", "Registry Run"),
             (RegistryHive.CurrentUser, RegistryView.Default, @"Software\Microsoft\Windows\CurrentVersion\RunOnce", "Current user", "Registry RunOnce"),
+            (RegistryHive.CurrentUser, RegistryView.Default, @"Software\Microsoft\Windows\CurrentVersion\RunServices", "Current user", "Registry RunServices"),
+            (RegistryHive.CurrentUser, RegistryView.Default, @"Software\Microsoft\Windows\CurrentVersion\RunServicesOnce", "Current user", "Registry RunServicesOnce"),
             (RegistryHive.CurrentUser, RegistryView.Default, @"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run", "Current user", "Registry Policy Run"),
             (RegistryHive.LocalMachine, RegistryView.Registry64, @"Software\Microsoft\Windows\CurrentVersion\Run", "All users x64", "Registry Run"),
             (RegistryHive.LocalMachine, RegistryView.Registry64, @"Software\Microsoft\Windows\CurrentVersion\RunOnce", "All users x64", "Registry RunOnce"),
+            (RegistryHive.LocalMachine, RegistryView.Registry64, @"Software\Microsoft\Windows\CurrentVersion\RunServices", "All users x64", "Registry RunServices"),
+            (RegistryHive.LocalMachine, RegistryView.Registry64, @"Software\Microsoft\Windows\CurrentVersion\RunServicesOnce", "All users x64", "Registry RunServicesOnce"),
             (RegistryHive.LocalMachine, RegistryView.Registry64, @"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run", "All users x64", "Registry Policy Run"),
             (RegistryHive.LocalMachine, RegistryView.Registry32, @"Software\Microsoft\Windows\CurrentVersion\Run", "All users x86", "Registry Run"),
             (RegistryHive.LocalMachine, RegistryView.Registry32, @"Software\Microsoft\Windows\CurrentVersion\RunOnce", "All users x86", "Registry RunOnce"),
-            (RegistryHive.LocalMachine, RegistryView.Registry32, @"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run", "All users x86", "Registry Policy Run")
+            (RegistryHive.LocalMachine, RegistryView.Registry32, @"Software\Microsoft\Windows\CurrentVersion\RunServices", "All users x86", "Registry RunServices"),
+            (RegistryHive.LocalMachine, RegistryView.Registry32, @"Software\Microsoft\Windows\CurrentVersion\RunServicesOnce", "All users x86", "Registry RunServicesOnce"),
+            (RegistryHive.LocalMachine, RegistryView.Registry32, @"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run", "All users x86", "Registry Policy Run"),
+            (RegistryHive.LocalMachine, RegistryView.Registry64, @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon", "System", "Winlogon Shell"),
+            (RegistryHive.LocalMachine, RegistryView.Registry64, @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon", "System", "Winlogon Userinit"),
+            (RegistryHive.LocalMachine, RegistryView.Registry64, @"System\CurrentControlSet\Control\Terminal Server\Wds\rdpwd", "System", "Terminal Server StartupPrograms")
         };
 
         foreach (var location in locations)
@@ -1696,12 +2627,38 @@ internal static class StartupReader
 
         foreach (var valueName in key.GetValueNames())
         {
+            if (type == "Winlogon Shell" && !valueName.Equals("Shell", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (type == "Winlogon Userinit" && !valueName.Equals("Userinit", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (type == "Terminal Server StartupPrograms" && !valueName.Equals("StartupPrograms", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var nextExecution = type switch
+            {
+                "Registry Run" or "Registry RunServices" or "Registry Policy Run" => "At sign-in",
+                "Registry RunOnce" or "Registry RunServicesOnce" => "Next sign-in",
+                "Winlogon Shell" or "Winlogon Userinit" => "At sign-in",
+                "Terminal Server StartupPrograms" => "At session start",
+                _ => "Unavailable"
+            };
+
             yield return new StartupEntry(
                 valueName,
                 scope,
                 type,
                 $@"{hive} [{view}]\{subKeyPath}",
-                key.GetValue(valueName)?.ToString() ?? string.Empty);
+                key.GetValue(valueName)?.ToString() ?? string.Empty,
+                "Unavailable",
+                nextExecution);
         }
     }
 
@@ -1715,8 +2672,157 @@ internal static class StartupReader
 
         foreach (var file in Directory.EnumerateFiles(path).OrderBy(Path.GetFileName, StringComparer.OrdinalIgnoreCase))
         {
-            yield return new StartupEntry(Path.GetFileNameWithoutExtension(file), scope, "Startup folder", path, file);
+            yield return new StartupEntry(Path.GetFileNameWithoutExtension(file), scope, "Startup folder", path, file, "Unavailable", "At sign-in");
         }
+    }
+
+    private static IEnumerable<StartupEntry> ReadScheduledStartupTasks()
+    {
+        ProcessStartInfo startInfo = new()
+        {
+            FileName = "schtasks.exe",
+            Arguments = "/query /fo csv /v",
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true
+        };
+
+        using var process = Process.Start(startInfo);
+        if (process is null)
+        {
+            yield break;
+        }
+
+        var output = process.StandardOutput.ReadToEnd();
+        process.WaitForExit(5000);
+        if (process.ExitCode != 0 || string.IsNullOrWhiteSpace(output))
+        {
+            yield break;
+        }
+
+        var rows = ParseCsv(output);
+        if (rows.Count < 2)
+        {
+            yield break;
+        }
+
+        var headers = rows[0];
+        var headerMap = headers
+            .Select((header, index) => new { header, index })
+            .ToDictionary(item => item.header, item => item.index, StringComparer.OrdinalIgnoreCase);
+
+        for (var index = 1; index < rows.Count; index++)
+        {
+            var row = rows[index];
+            var scheduleType = GetCsvValue(row, headerMap, "Schedule Type");
+            if (!(scheduleType.Contains("logon", StringComparison.OrdinalIgnoreCase)
+                || scheduleType.Contains("startup", StringComparison.OrdinalIgnoreCase)
+                || scheduleType.Contains("boot", StringComparison.OrdinalIgnoreCase)))
+            {
+                continue;
+            }
+
+            var taskName = GetCsvValue(row, headerMap, "TaskName");
+            var command = GetCsvValue(row, headerMap, "Task To Run");
+            if (string.IsNullOrWhiteSpace(command))
+            {
+                command = GetCsvValue(row, headerMap, "Actions");
+            }
+
+            yield return new StartupEntry(
+                taskName,
+                "Task Scheduler",
+                "Scheduled Task",
+                @"Task Scheduler Library",
+                command,
+                NormalizeTaskTime(GetCsvValue(row, headerMap, "Last Run Time")),
+                NormalizeTaskTime(GetCsvValue(row, headerMap, "Next Run Time")));
+        }
+    }
+
+    private static string NormalizeTaskTime(string value)
+    {
+        return string.IsNullOrWhiteSpace(value) || value.Equals("N/A", StringComparison.OrdinalIgnoreCase)
+            ? "Unavailable"
+            : value;
+    }
+
+    private static string GetCsvValue(IReadOnlyList<string> row, IReadOnlyDictionary<string, int> headerMap, string header)
+    {
+        return headerMap.TryGetValue(header, out var index) && index < row.Count
+            ? row[index]
+            : string.Empty;
+    }
+
+    private static List<List<string>> ParseCsv(string csv)
+    {
+        List<List<string>> rows = [];
+        List<string> currentRow = [];
+        System.Text.StringBuilder currentValue = new();
+        var inQuotes = false;
+
+        for (var index = 0; index < csv.Length; index++)
+        {
+            var ch = csv[index];
+            if (inQuotes)
+            {
+                if (ch == '"')
+                {
+                    if (index + 1 < csv.Length && csv[index + 1] == '"')
+                    {
+                        currentValue.Append('"');
+                        index++;
+                    }
+                    else
+                    {
+                        inQuotes = false;
+                    }
+                }
+                else
+                {
+                    currentValue.Append(ch);
+                }
+
+                continue;
+            }
+
+            if (ch == '"')
+            {
+                inQuotes = true;
+            }
+            else if (ch == ',')
+            {
+                currentRow.Add(currentValue.ToString());
+                currentValue.Clear();
+            }
+            else if (ch == '\r')
+            {
+            }
+            else if (ch == '\n')
+            {
+                currentRow.Add(currentValue.ToString());
+                currentValue.Clear();
+                if (currentRow.Count > 1 || (currentRow.Count == 1 && !string.IsNullOrWhiteSpace(currentRow[0])))
+                {
+                    rows.Add(currentRow);
+                }
+
+                currentRow = [];
+            }
+            else
+            {
+                currentValue.Append(ch);
+            }
+        }
+
+        if (currentValue.Length > 0 || currentRow.Count > 0)
+        {
+            currentRow.Add(currentValue.ToString());
+            rows.Add(currentRow);
+        }
+
+        return rows;
     }
 }
 

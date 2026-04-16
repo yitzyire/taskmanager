@@ -11,6 +11,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="Microsoft.Diagnostics.Tracing.TraceEvent" Version="3.1.6" />
+  </ItemGroup>
+
+  <ItemGroup>
     <Reference Include="System.ServiceProcess.ServiceController">
       <HintPath>C:\Program Files\dotnet\sdk\10.0.100\runtimes\win\lib\net10.0\System.ServiceProcess.ServiceController.dll</HintPath>
     </Reference>
