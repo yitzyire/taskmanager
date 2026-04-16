@@ -18,13 +18,8 @@ static class Program
     {
         try
         {
-            var logPath = Path.Combine(AppContext.BaseDirectory, "crash.log");
-            File.AppendAllText(
-                logPath,
-                $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {title}{Environment.NewLine}{exception}{Environment.NewLine}{Environment.NewLine}");
-
             MessageBox.Show(
-                $"{title}\n\n{exception.Message}\n\nA crash log was written to:\n{logPath}",
+                $"{title}\n\n{exception.Message}",
                 "TaskManager",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Error);
